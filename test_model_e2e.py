@@ -166,23 +166,105 @@ def run_e2e_model_test():
         input_tensor = input_tensor.unsqueeze(0).unsqueeze(0).to(device)  # Add batch and stem dims
         input_tensor = input_tensor.repeat(1, 4, 1, 1)  # -> (1, 4, 81, time)
 
-        print(f"SUCCESS: Pre-processing complete. Input tensor shape: {input_tensor.shape}")
-        print(f"Input range: [{input_tensor.min():.3f}, {input_tensor.max():.3f}], "
-              f"Mean: {input_tensor.mean():.3f}, Std: {input_tensor.std():.3f}")
-        print(f"First few values: {input_tensor.flatten()[:5].tolist()}")
+        print(f"SUCCESS: Pre-processing complete. Input shape: {input_tensor.shape}")
+        print(f"Input range: [{torch.min(input_tensor):.3f}, {torch.max(input_tensor):.3f}], "
+              f"Mean: {torch.mean(input_tensor):.3f}, Std: {torch.std(input_tensor):.3f}")
+        print(f"First few values: {input_tensor[0, 0, 0, :5].tolist()}\n")
+
+        # --- Chunking Parameters ---
+        CHUNK_SIZE = 4096  # Must be less than model's max sequence length (5000)
+        HOP_SIZE = 3584    # Overlap = CHUNK_SIZE - HOP_SIZE = 512 samples
+        MIN_CHUNK_SIZE = 128  # Skip chunks smaller than this
         
+        # Get total number of time steps
+        total_steps = input_tensor.shape[-1]
+        num_chunks = (total_steps + HOP_SIZE - 1) // HOP_SIZE  # Ceiling division
+        
+        print(f"Processing {total_steps} time steps in {num_chunks} chunks...")
+        print(f"Chunk size: {CHUNK_SIZE}, Hop size: {HOP_SIZE}, Overlap: {CHUNK_SIZE - HOP_SIZE}")
+        
+        # Store outputs for each chunk
+        all_chunk_outputs = []
+        
+        # Process each chunk
+        with torch.no_grad():
+            for i in range(0, total_steps, HOP_SIZE):
+                # Calculate chunk boundaries
+                chunk_start = i
+                chunk_end = min(i + CHUNK_SIZE, total_steps)
+                chunk = input_tensor[..., chunk_start:chunk_end]
+                
+                # Skip if chunk is too small
+                if chunk.shape[-1] < MIN_CHUNK_SIZE:
+                    print(f"Skipping small chunk: {chunk.shape[-1]} samples")
+                    continue
+                    
+                print(f"Processing chunk: steps {chunk_start} to {chunk_end-1} (size: {chunk.shape[-1]})")
+                
+                # Process chunk
+                chunk_output = model(chunk)
+                all_chunk_outputs.append((chunk_start, chunk_output))
+        
+        # --- Stitching Logic ---
+        if not all_chunk_outputs:
+            raise ValueError("No valid chunks were processed")
+            
+        print("\nStitching chunks together...")
+        
+        # Initialize stitched outputs dictionary
+        stitched_outputs = {}
+        output_heads = all_chunk_outputs[0][1].keys()  # Get output head names
+        
+        for head in output_heads:
+            # Get feature dimension from first chunk
+            feature_dim = all_chunk_outputs[0][1][head].shape[-1]
+            
+            # Create output tensor with proper shape
+            # Shape: (batch * stems, total_steps, feature_dim)
+            batch_stems = all_chunk_outputs[0][1][head].shape[0]
+            full_output = torch.zeros((batch_stems, total_steps, feature_dim), 
+                                   device=input_tensor.device)
+            
+            # Create overlap-add window (simple linear fade)
+            window = torch.ones(CHUNK_SIZE, device=input_tensor.device)
+            if CHUNK_SIZE > HOP_SIZE:
+                # Create fade in/out for overlapping regions
+                overlap = CHUNK_SIZE - HOP_SIZE
+                window[:overlap] = torch.linspace(0, 1, overlap, device=input_tensor.device)
+                window[-overlap:] = torch.linspace(1, 0, overlap, device=input_tensor.device)
+            
+            # Stitch chunks together with overlap-add
+            for chunk_start, chunk_output in all_chunk_outputs:
+                chunk_data = chunk_output[head]
+                chunk_size = chunk_data.shape[1]
+                chunk_end = chunk_start + chunk_size
+                
+                # Apply window
+                chunk_data = chunk_data * window[:chunk_size]
+                
+                # Add to output with overlap-add
+                full_output[..., chunk_start:chunk_end, :] += chunk_data
+            
+            stitched_outputs[head] = full_output
+        
+        print("\nStitching complete!")
+        print("\nStitched output shapes:")
+        for key, value in stitched_outputs.items():
+            print(f"  {key}: {value.shape}")
+            
+        # For backward compatibility, assign to outputs
+        outputs = stitched_outputs
+
     except Exception as e:
-        print(f"FATAL ERROR: Could not pre-process audio. Test aborted. Details: {e}")
-        import traceback
-        traceback.print_exc()
-        return
+        print(f"FATAL ERROR: Could not run model inference. Test aborted. Details: {str(e)}")
+        print(f"Error type: {type(e).__name__}")
+        if 'all_chunk_outputs' in locals():
+            print(f"Number of processed chunks: {len(all_chunk_outputs)}")
+        raise
 
     # === 4. Run Model Inference ===
     print("\n--> Running Model Inference...")
     try:
-        with torch.no_grad():
-            outputs = model(input_tensor)
-        
         print("\n=== TEST COMPLETE ===")
         print("SUCCESS: Forward pass completed successfully!")
         print("\nModel Outputs:")
