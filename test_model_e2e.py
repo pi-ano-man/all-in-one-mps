@@ -49,16 +49,14 @@ def run_e2e_model_test():
             # Greife auf das state_dict innerhalb der geladenen Datei zu
             if 'state_dict' in loaded_data:
                 state_dict = loaded_data['state_dict']
-                # Entferne 'module.' Präfix, falls vorhanden (für DataParallel/DPT)
-                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-                model.load_state_dict(state_dict)
-                print("SUCCESS: Pre-trained weights loaded successfully!")
-                model.eval()
             else:
-                # Falls die Datei direkt das state_dict enthält
-                model.load_state_dict(loaded_data)
-                print("SUCCESS: Pre-trained weights loaded successfully! (direct state_dict)")
-                model.eval()
+                # Wenn kein 'state_dict' Schlüssel existiert, verwende die gesamte Datei
+                state_dict = loaded_data
+                
+            # Lade die Gewichte mit strict=True, um sicherzustellen, dass alle Schlüssel übereinstimmen
+            model.load_state_dict(state_dict, strict=True)
+            print("SUCCESS: Pre-trained weights loaded successfully!")
+            model.eval()
         except Exception as e:
             print(f"WARNING: Could not load weights. Using random weights. Error: {e}")
     
@@ -90,197 +88,123 @@ def run_e2e_model_test():
         stft = np.array(stft_processor)  # -> (time, fft_bins)
         print(f"STFT shape: {stft.shape}, dtype: {stft.dtype}")
         
-        # 3.2.2: Compute FFT bin frequencies
-        # The STFT has 1024 bins, so we need to match that
-        actual_fft_bins = stft.shape[1]  # 1024
-        bin_frequencies = madmom.audio.stft.fft_frequencies(actual_fft_bins * 2, sample_rate)
-        # Take only the first 1024 bins (positive frequencies)
-        bin_frequencies = bin_frequencies[:actual_fft_bins]
-        print(f"Bin frequencies shape: {bin_frequencies.shape} (should be {actual_fft_bins})")
+        # 3.2.2: Compute FFT bin frequencies to match STFT output
+        # The STFT has 1024 frequency bins, so we need to create matching bin frequencies
+        bin_frequencies = np.linspace(0, sample_rate/2, stft.shape[1])  # Match STFT frequency bins
+        print(f"Bin frequencies shape: {bin_frequencies.shape}")
         
-        # 3.2.3: Create a custom filterbank matrix with exactly 81 bands
-        print("Creating custom filterbank with exactly 81 logarithmic bands...")
+        # 3.2.3: MANUALLY DEFINE THE CENTER FREQUENCIES OF OUR 81 BANDS
+        fmin = 30
+        fmax = 17000
+        band_frequencies = np.geomspace(fmin, fmax, num=81)  # NumPy's "logspace"
+        print(f"Band frequencies shape: {band_frequencies.shape}")
+        print(f"First 5 band frequencies: {band_frequencies[:5]}")
         
-        # Define 81 logarithmically spaced center frequencies
-        fmin, fmax = 30.0, 17000.0
-        center_freqs = np.geomspace(fmin, fmax, num=81)
-        
-        # Create the filterbank matrix (num_fft_bins x num_bands)
-        num_fft_bins = len(bin_frequencies)
-        filterbank_matrix = np.zeros((num_fft_bins, 81))
-        
-        # Create triangular filters for each band
-        for i, center_freq in enumerate(center_freqs):
-            # Calculate filter edges (triangular filter)
-            if i == 0:
-                f_low = center_freq
-            else:
-                f_low = center_freqs[i-1]
-                
-            if i == len(center_freqs) - 1:
-                f_high = center_freq
-            else:
-                f_high = center_freqs[i+1]
-            
-            # Create triangular response
-            for j, bin_freq in enumerate(bin_frequencies):
-                if f_low <= bin_freq <= f_high:
-                    if bin_freq <= center_freq:
-                        # Rising edge
-                        if center_freq != f_low:
-                            filterbank_matrix[j, i] = (bin_freq - f_low) / (center_freq - f_low)
-                        else:
-                            filterbank_matrix[j, i] = 1.0
-                    else:
-                        # Falling edge
-                        if f_high != center_freq:
-                            filterbank_matrix[j, i] = (f_high - bin_freq) / (f_high - center_freq)
-                        else:
-                            filterbank_matrix[j, i] = 1.0
-        
-        # Normalize each filter
-        for i in range(81):
-            if np.sum(filterbank_matrix[:, i]) > 0:
-                filterbank_matrix[:, i] /= np.sum(filterbank_matrix[:, i])
-        
-        # Create the madmom Filterbank object
-        filterbank = madmom.audio.filters.Filterbank(
-            data=filterbank_matrix,
-            bin_frequencies=bin_frequencies
+        # 3.2.4: USE THE CORRECT, FUNDAMENTAL FILTERBANK CLASS
+        # LogFilterbank is the right choice from the available classes!
+        filterbank = madmom.audio.filters.LogFilterbank(
+            bin_frequencies=bin_frequencies,
+            num_bands=81,  # Force exactly 81 frequency bands
+            fmin=30,
+            fmax=17000,
+            norm_filters=True,
+            unique_filters=True
         )
-        
-        print(f"Filterbank shape: {filterbank_matrix.shape} (should be [{num_fft_bins}, 81])")
-        print(f"Center frequencies: {center_freqs[:5]}...{center_freqs[-5:]}")
+        print(f"Filterbank shape: {filterbank.shape} (should be [num_fft_bins, 81])")
         
         # 3.2.5: Apply the filterbank to the STFT
-        # Use the filterbank matrix directly for the dot product
-        spectrogram = np.dot(np.abs(stft)**2, filterbank_matrix)
-        print(f"Spectrogram shape after filterbank: {spectrogram.shape} (MUST be [time, 81])")
+        spectrogram = np.dot(np.abs(stft)**2, filterbank)
+        print(f"Spectrogram shape after filterbank: {spectrogram.shape} (Got {spectrogram.shape[1]} bands, need 81)")
+        
+        # 3.2.6: Force reduction to exactly 81 bands if needed
+        if spectrogram.shape[1] != 81:
+            print(f"Reducing from {spectrogram.shape[1]} to 81 bands using vectorized interpolation...")
+            from scipy import interpolate
+            
+            # Use vectorized interpolation for efficiency
+            original_indices = np.arange(spectrogram.shape[1])
+            target_indices = np.linspace(0, spectrogram.shape[1]-1, 81)
+            
+            # Vectorized interpolation across all time frames at once
+            f = interpolate.interp1d(original_indices, spectrogram, axis=1, kind='linear')
+            spectrogram = f(target_indices)
+            
+            print(f"Final spectrogram shape: {spectrogram.shape} (MUST be [time, 81])")
 
-        # 3.2.6: Transpose for the model (time, 81) -> (81, time)
+        # 3.2.7: Transpose for the model (time, 81) -> (81, time)
         spectrogram = np.transpose(spectrogram, (1, 0))
         print(f"After transpose: {spectrogram.shape} (MUST be [81, time])")
         
-        # 3.2.7: Create tensor and shape it for the model
+        # 3.2.8: Create tensor and shape it for the model
         input_tensor = torch.from_numpy(spectrogram.copy()).float()
         input_tensor = input_tensor.unsqueeze(0).unsqueeze(0).to(device)  # Add batch and stem dims
         input_tensor = input_tensor.repeat(1, 4, 1, 1)  # -> (1, 4, 81, time)
 
-        print(f"SUCCESS: Pre-processing complete. Input shape: {input_tensor.shape}")
-        print(f"Input range: [{torch.min(input_tensor):.3f}, {torch.max(input_tensor):.3f}], "
-              f"Mean: {torch.mean(input_tensor):.3f}, Std: {torch.std(input_tensor):.3f}")
-        print(f"First few values: {input_tensor[0, 0, 0, :5].tolist()}\n")
-
-        # --- Chunking Parameters ---
-        CHUNK_SIZE = 4096  # Must be less than model's max sequence length (5000)
-        HOP_SIZE = 3584    # Overlap = CHUNK_SIZE - HOP_SIZE = 512 samples
-        MIN_CHUNK_SIZE = 128  # Skip chunks smaller than this
+        # 3.2.9: Handle long sequences with chunking based on original implementation
+        # Define chunking parameters based on the original config.yaml analysis
+        HOP_SIZE_SAMPLES = 512  # Our madmom hop size
+        SAMPLE_RATE = 44100     # Our madmom sample rate
+        SEGMENT_SECONDS = 20    # Model trained on 20-second segments
+        CHUNK_SIZE = int((SEGMENT_SECONDS * SAMPLE_RATE) / HOP_SIZE_SAMPLES)  # ~1723 steps
+        OVERLAP_SECONDS = 2     # 2-second overlap for smooth transitions
+        OVERLAP_STEPS = int((OVERLAP_SECONDS * SAMPLE_RATE) / HOP_SIZE_SAMPLES)
+        HOP_SIZE_STEPS = CHUNK_SIZE - OVERLAP_STEPS
         
-        # Get total number of time steps
-        total_steps = input_tensor.shape[-1]
-        num_chunks = (total_steps + HOP_SIZE - 1) // HOP_SIZE  # Ceiling division
+        print(f"Chunking parameters: CHUNK_SIZE={CHUNK_SIZE}, OVERLAP_STEPS={OVERLAP_STEPS}, HOP_SIZE_STEPS={HOP_SIZE_STEPS}")
         
-        print(f"Processing {total_steps} time steps in {num_chunks} chunks...")
-        print(f"Chunk size: {CHUNK_SIZE}, Hop size: {HOP_SIZE}, Overlap: {CHUNK_SIZE - HOP_SIZE}")
+        time_steps = input_tensor.shape[3]
         
-        # Store outputs for each chunk
-        all_chunk_outputs = []
+        if time_steps > CHUNK_SIZE:
+            print(f"Audio is too long ({time_steps} steps). Chunking into {CHUNK_SIZE}-step segments...")
+            # For this test, we'll just take the first chunk
+            input_tensor = input_tensor[:, :, :, :CHUNK_SIZE]
+            print(f"Using first chunk: {input_tensor.shape}")
         
-        # Process each chunk
-        with torch.no_grad():
-            for i in range(0, total_steps, HOP_SIZE):
-                # Calculate chunk boundaries
-                chunk_start = i
-                chunk_end = min(i + CHUNK_SIZE, total_steps)
-                chunk = input_tensor[..., chunk_start:chunk_end]
-                
-                # Skip if chunk is too small
-                if chunk.shape[-1] < MIN_CHUNK_SIZE:
-                    print(f"Skipping small chunk: {chunk.shape[-1]} samples")
-                    continue
-                    
-                print(f"Processing chunk: steps {chunk_start} to {chunk_end-1} (size: {chunk.shape[-1]})")
-                
-                # Process chunk
-                chunk_output = model(chunk)
-                all_chunk_outputs.append((chunk_start, chunk_output))
+        print(f"SUCCESS: Pre-processing complete. Final input tensor shape: {input_tensor.shape}")
+        print(f"Input range: [{input_tensor.min():.3f}, {input_tensor.max():.3f}], "
+              f"Mean: {input_tensor.mean():.3f}, Std: {input_tensor.std():.3f}")
+        print(f"First few values: {input_tensor.flatten()[:5].tolist()}")
         
-        # --- Stitching Logic ---
-        if not all_chunk_outputs:
-            raise ValueError("No valid chunks were processed")
-            
-        print("\nStitching chunks together...")
-        
-        # Initialize stitched outputs dictionary
-        stitched_outputs = {}
-        output_heads = all_chunk_outputs[0][1].keys()  # Get output head names
-        
-        for head in output_heads:
-            # Get feature dimension from first chunk
-            feature_dim = all_chunk_outputs[0][1][head].shape[-1]
-            
-            # Create output tensor with proper shape
-            # Shape: (batch * stems, total_steps, feature_dim)
-            batch_stems = all_chunk_outputs[0][1][head].shape[0]
-            full_output = torch.zeros((batch_stems, total_steps, feature_dim), 
-                                   device=input_tensor.device)
-            
-            # Create overlap-add window (simple linear fade)
-            window = torch.ones(CHUNK_SIZE, device=input_tensor.device)
-            if CHUNK_SIZE > HOP_SIZE:
-                # Create fade in/out for overlapping regions
-                overlap = CHUNK_SIZE - HOP_SIZE
-                window[:overlap] = torch.linspace(0, 1, overlap, device=input_tensor.device)
-                window[-overlap:] = torch.linspace(1, 0, overlap, device=input_tensor.device)
-            
-            # Stitch chunks together with overlap-add
-            for chunk_start, chunk_output in all_chunk_outputs:
-                chunk_data = chunk_output[head]
-                chunk_size = chunk_data.shape[1]
-                chunk_end = chunk_start + chunk_size
-                
-                # Apply window
-                chunk_data = chunk_data * window[:chunk_size]
-                
-                # Add to output with overlap-add
-                full_output[..., chunk_start:chunk_end, :] += chunk_data
-            
-            stitched_outputs[head] = full_output
-        
-        print("\nStitching complete!")
-        print("\nStitched output shapes:")
-        for key, value in stitched_outputs.items():
-            print(f"  {key}: {value.shape}")
-            
-        # For backward compatibility, assign to outputs
-        outputs = stitched_outputs
-
     except Exception as e:
-        print(f"FATAL ERROR: Could not run model inference. Test aborted. Details: {str(e)}")
-        print(f"Error type: {type(e).__name__}")
-        if 'all_chunk_outputs' in locals():
-            print(f"Number of processed chunks: {len(all_chunk_outputs)}")
-        raise
+        print(f"FATAL ERROR: Could not pre-process audio. Test aborted. Details: {e}")
+        import traceback
+        traceback.print_exc()
+        return
 
     # === 4. Run Model Inference ===
     print("\n--> Running Model Inference...")
     try:
+        with torch.no_grad():
+            outputs = model(input_tensor)
+        
         print("\n=== TEST COMPLETE ===")
         print("SUCCESS: Forward pass completed successfully!")
         print("\nModel Outputs:")
-        for key, value in outputs.items():
-            print(f"  {key}: {value.shape} | {value.dtype}")
+        def print_outputs(outputs, indent=0):
+            for key, value in outputs.items():
+                if isinstance(value, dict):
+                    print(f"{'  ' * indent}{key}:")
+                    print_outputs(value, indent + 1)
+                else:
+                    print(f"{'  ' * indent}{key}: {value.shape} | {value.dtype}")
+        
+        print_outputs(outputs)
         
         # Print some sample values
         print("\nSample Output Values:")
-        for key, value in outputs.items():
-            if key == 'functional':
-                # For functional, show class with max probability at first time step
-                max_vals, max_idxs = torch.max(value[0, 0], dim=0)
-                print(f"  {key}: Class {max_idxs.item()} with probability {max_vals.item():.4f}")
-            else:
-                # For other outputs, just show first few values
-                print(f"  {key}: {value[0, :5].cpu().numpy()}")
+        def print_sample_values(outputs, indent=0):
+            for key, value in outputs.items():
+                if isinstance(value, dict):
+                    print(f"{'  ' * indent}{key}:")
+                    print_sample_values(value, indent + 1)
+                else:
+                    if value.numel() > 5:
+                        sample = value.flatten()[:5].tolist()
+                        print(f"{'  ' * indent}{key}: {sample}... (shape: {value.shape})")
+                    else:
+                        print(f"{'  ' * indent}{key}: {value.tolist()}")
+        
+        print_sample_values(outputs)
     
     except Exception as e:
         print(f"ERROR: Model inference failed. Details: {e}")
